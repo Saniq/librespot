@@ -36,6 +36,7 @@ struct PlayerInternal {
     commands: std::sync::mpsc::Receiver<PlayerCommand>,
 
     state: PlayerState,
+    preload_track: Option<PreloadTrack>,
     sink: Box<dyn Sink>,
     sink_running: bool,
     audio_filter: Option<Box<dyn AudioFilter + Send>>,
@@ -44,6 +45,7 @@ struct PlayerInternal {
 
 enum PlayerCommand {
     Load(SpotifyId, bool, u32, oneshot::Sender<()>),
+    Preload(SpotifyId),
     Play,
     Pause,
     Stop,
@@ -67,6 +69,14 @@ pub enum PlayerEvent {
 }
 
 type PlayerEventChannel = futures::sync::mpsc::UnboundedReceiver<PlayerEvent>;
+
+struct PreloadTrack {
+    track_id: SpotifyId,
+    decoder: Decoder,
+    normalisation_factor: f32,
+    stream_loader_controller: StreamLoaderController,
+    bytes_per_second: usize,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct NormalisationData {
@@ -137,6 +147,7 @@ impl Player {
                 commands: cmd_rx,
 
                 state: PlayerState::Stopped,
+                preload_track: None,
                 sink: sink_builder(),
                 sink_running: false,
                 audio_filter: audio_filter,
@@ -169,6 +180,10 @@ impl Player {
         self.command(PlayerCommand::Load(track, start_playing, position_ms, tx));
 
         rx
+    }
+
+    pub fn preload(&self, track: SpotifyId) {
+        self.command(PlayerCommand::Preload(track))
     }
 
     pub fn play(&self) {
@@ -378,7 +393,31 @@ impl PlayerInternal {
                 };
 
                 if let Some(packet) = packet {
-                    self.handle_packet(packet, current_normalisation_factor);
+                    if !self.handle_packet(packet, current_normalisation_factor) {
+                        self.state.playing_to_end_of_track();
+                    }
+                }
+
+                if let PlayerState::EndOfTrack { .. } = self.state {
+                    let mut preload_normalisation_factor: f32 = 1.0;
+
+                    let preload_packet = if let Some(PreloadTrack {
+                        ref mut decoder,
+                        normalisation_factor,
+                        ..
+                    }) = self.preload_track
+                    {
+                        preload_normalisation_factor = normalisation_factor;
+                        Some(decoder.next_packet().expect("Vorbis error"))
+                    } else {
+                        None
+                    };
+
+                    if let Some(preload_packet) = preload_packet {
+                        if !self.handle_packet(preload_packet, preload_normalisation_factor) {
+                            self.stop_sink();
+                        }
+                    }
                 }
             }
 
@@ -406,7 +445,7 @@ impl PlayerInternal {
         self.sink_running = false;
     }
 
-    fn handle_packet(&mut self, packet: Option<VorbisPacket>, normalisation_factor: f32) {
+    fn handle_packet(&mut self, packet: Option<VorbisPacket>, normalisation_factor: f32) -> bool {
         match packet {
             Some(mut packet) => {
                 if packet.data().len() > 0 {
@@ -425,11 +464,11 @@ impl PlayerInternal {
                         self.stop_sink();
                     }
                 }
+                true
             }
 
             None => {
-                self.stop_sink();
-                self.state.playing_to_end_of_track();
+                false
             }
         }
     }
@@ -438,17 +477,27 @@ impl PlayerInternal {
         debug!("command={:?}", cmd);
         match cmd {
             PlayerCommand::Load(track_id, play, position, end_of_track) => {
-                if self.state.is_playing() {
-                    self.stop_sink_if_running();
-                }
+                let preload = if let Some(preload_state) = mem::replace(&mut self.preload_track, None)
+                {
+                    if track_id == preload_state.track_id && position == 0 {
+                        Some(preload_state)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
-                match self.load_track(track_id, position as i64) {
-                    Some((
+                match preload {
+                    Some(PreloadTrack {
+                        track_id,
                         decoder,
                         normalisation_factor,
                         stream_loader_controller,
                         bytes_per_second,
-                    )) => {
+                    }) => {
+                        debug!("Using preloaded track");
+
                         if play {
                             match self.state {
                                 PlayerState::Playing {
@@ -464,8 +513,6 @@ impl PlayerInternal {
                                 }),
                                 _ => self.send_event(PlayerEvent::Started { track_id }),
                             }
-
-                            self.start_sink();
 
                             self.state = PlayerState::Playing {
                                 track_id: track_id,
@@ -501,9 +548,105 @@ impl PlayerInternal {
                             self.send_event(PlayerEvent::Stopped { track_id });
                         }
                     }
+                    None => {
+                        if self.state.is_playing() {
+                            self.stop_sink_if_running();
+                        }
+    
+                        match self.load_track(track_id, position as i64) {
+                            Some((
+                                decoder,
+                                normalisation_factor,
+                                stream_loader_controller,
+                                bytes_per_second,
+                            )) => {
+                                if play {
+                                    match self.state {
+                                        PlayerState::Playing {
+                                            track_id: old_track_id,
+                                            ..
+                                        }
+                                        | PlayerState::EndOfTrack {
+                                            track_id: old_track_id,
+                                            ..
+                                        } => self.send_event(PlayerEvent::Changed {
+                                            old_track_id: old_track_id,
+                                            new_track_id: track_id,
+                                        }),
+                                        _ => self.send_event(PlayerEvent::Started { track_id }),
+                                    }
+    
+                                    self.start_sink();
+    
+                                    self.state = PlayerState::Playing {
+                                        track_id: track_id,
+                                        decoder: decoder,
+                                        end_of_track: end_of_track,
+                                        normalisation_factor: normalisation_factor,
+                                        stream_loader_controller: stream_loader_controller,
+                                        bytes_per_second: bytes_per_second,
+                                    };
+                                } else {
+                                    self.state = PlayerState::Paused {
+                                        track_id: track_id,
+                                        decoder: decoder,
+                                        end_of_track: end_of_track,
+                                        normalisation_factor: normalisation_factor,
+                                        stream_loader_controller: stream_loader_controller,
+                                        bytes_per_second: bytes_per_second,
+                                    };
+                                    match self.state {
+                                        PlayerState::Playing {
+                                            track_id: old_track_id,
+                                            ..
+                                        }
+                                        | PlayerState::EndOfTrack {
+                                            track_id: old_track_id,
+                                            ..
+                                        } => self.send_event(PlayerEvent::Changed {
+                                            old_track_id: old_track_id,
+                                            new_track_id: track_id,
+                                        }),
+                                        _ => (),
+                                    }
+                                    self.send_event(PlayerEvent::Stopped { track_id });
+                                }
+                            }
+                        
+                            None => {
+                                let _ = end_of_track.send(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            PlayerCommand::Preload(track_id) => {
+                if let Some(preload_track) = &self.preload_track {
+                    if track_id == preload_track.track_id {
+                        return;
+                    }
+                }
+
+                match self.load_track(track_id, 0) {
+                    Some((
+                        decoder,
+                        normalisation_factor,
+                        stream_loader_controller,
+                        bytes_per_second,
+                    )) => {
+                        self.preload_track = Some(PreloadTrack {
+                            track_id: track_id,
+                            decoder: decoder,
+                            normalisation_factor: normalisation_factor,
+                            stream_loader_controller: stream_loader_controller,
+                            bytes_per_second: bytes_per_second,
+                        });
+                        debug!("Preloading finished");
+                    }
 
                     None => {
-                        let _ = end_of_track.send(());
+                        error!("Preloading failed");
                     }
                 }
             }
@@ -769,6 +912,7 @@ impl ::std::fmt::Debug for PlayerCommand {
                 .field(&play)
                 .field(&position)
                 .finish(),
+            PlayerCommand::Preload(track) => f.debug_tuple("Preload").field(&track).finish(),
             PlayerCommand::Play => f.debug_tuple("Play").finish(),
             PlayerCommand::Pause => f.debug_tuple("Pause").finish(),
             PlayerCommand::Stop => f.debug_tuple("Stop").finish(),

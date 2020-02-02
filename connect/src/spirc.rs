@@ -536,6 +536,7 @@ impl SpircTask {
 
                     let play = frame.get_state().get_status() == PlayStatus::kPlayStatusPlay;
                     self.load_track(play);
+                    self.preload_track();
                 } else {
                     info!("No more tracks left in queue");
                     self.state.set_status(PlayStatus::kPlayStatusStop);
@@ -599,6 +600,7 @@ impl SpircTask {
                         }
                     }
                     self.state.set_playing_track_index(0);
+                    self.preload_track();
                 } else {
                     let context = self.state.get_context_uri();
                     debug!("{:?}", context);
@@ -618,6 +620,7 @@ impl SpircTask {
 
             MessageType::kMessageTypeReplace => {
                 self.update_tracks(&frame);
+                self.preload_track();
                 self.notify(None);
             }
 
@@ -725,6 +728,7 @@ impl SpircTask {
             self.state.set_position_measured_at(now as u64);
 
             self.load_track(continue_playing);
+            self.preload_track();
         } else {
             info!("Not playing next track because there are no more tracks left in queue.");
             self.state.set_playing_track_index(0);
@@ -771,6 +775,7 @@ impl SpircTask {
             self.state.set_position_measured_at(now as u64);
 
             self.load_track(true);
+            self.preload_track();
         } else {
             let now = self.now_ms();
             self.state.set_position_ms(0);
@@ -959,6 +964,46 @@ impl SpircTask {
         }
 
         self.end_of_track = Box::new(end_of_track);
+    }
+
+    fn preload_track(&mut self) {
+        let context_uri = self.state.get_context_uri().to_owned();
+        let playing_index = self.state.get_playing_track_index();
+        let tracks_len = self.state.get_track().len() as u32;
+        let mut index = if playing_index + 1 < tracks_len { playing_index + 1 } else { 0 };
+        let start_index = index;
+        debug!(
+            "Preloading context: <{}> index: [{}] of {}",
+            context_uri, index, tracks_len
+        );
+        // Cycle through all tracks, break if we don't find any playable tracks
+        // TODO: This will panic if no playable tracks are found!
+        // tracks in each frame either have a gid or uri (that may or may not be a valid track)
+        // E.g - context based frames sometimes contain tracks with <spotify:meta:page:>
+        let track = {
+            let mut track_ref = self.state.get_track()[index as usize].clone();
+            let mut track_id = self.get_spotify_id_for_track(&track_ref);
+            while track_id.is_err() || track_id.unwrap().audio_type == SpotifyAudioType::NonPlayable
+            {
+                warn!(
+                    "Skipping preloading track <{:?}> at position [{}] of {}",
+                    track_ref.get_uri(),
+                    index,
+                    tracks_len
+                );
+                index = if index + 1 < tracks_len { index + 1 } else { 0 };
+                if index == start_index {
+                    warn!("No preloadable track found in state: {:?}", self.state);
+                    break;
+                }
+                track_ref = self.state.get_track()[index as usize].clone();
+                track_id = self.get_spotify_id_for_track(&track_ref);
+            }
+            track_id
+        }
+        .expect("Invalid SpotifyId");
+
+        self.player.preload(track);
     }
 
     fn hello(&mut self) {
